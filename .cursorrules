@@ -1,0 +1,166 @@
+# maritime-flow
+
+## Project Overview
+Maritime vessel tracking and trade flow inference system.
+Processes real-time AIS (Automatic Identification System) 
+data from vessels to detect anomalous behaviour and infer 
+trade flows. Built as a learning project for Flink, 
+SedonaFlink, Kafka, and remote sensing integration.
+
+## Repository Structure
+maritime-flow/
+├── ais-collector/     WebSocket client, reads from aisstream.io, 
+│                      writes raw JSON to Kafka
+├── ais-filter/        Coarse stateless filter, runs on Hetzner
+├── ais-smartfilter/   Proximity and watchlist aware filter, 
+│                      runs on Minisforum
+├── ais-merge/         Multi-source deduplication
+├── ais-analyser/      Main Flink + SedonaFlink processing app
+├── common/            Shared models, constants, enums
+├── reference-data/    PostGIS layer loading scripts
+└── k8s/               K3s deployment manifests
+
+## Language and Build
+- Java 17
+- Maven, no parent pom — each module is an independent 
+  Maven project
+- No Gradle suggestions
+- No Kotlin suggestions
+
+## Core Technology Stack
+- Apache Flink — stream processing engine
+- Apache SedonaFlink — spatial operations on Flink streams
+- Redpanda — Kafka-compatible message broker (used everywhere,
+  referred to as Kafka in code)
+- PostgreSQL + PostGIS — spatial reference layers and 
+  vessel state document store (JSONB)
+- OkHttp — WebSocket client in ais-collector
+- Jackson — JSON serialisation/deserialisation
+- Protobuf — internal Kafka event topics only
+- MapLibre GL JS — globe frontend (future)
+- Sentinel/Copernicus API — SAR imagery integration (future)
+
+## Infrastructure
+Hetzner VPS (always on):
+- ais-collector, ais-filter
+- Redpanda: topics ais.aisstream, ais.coarse (7 day retention)
+
+Minisforum CachyOS (usually on):
+- All other modules
+- Redpanda: long term archive 30+ days
+- MirrorMaker 2: replicates from Hetzner
+- K3s: runs ais-analyser, PostGIS, frontend
+
+## Kafka Topics
+Raw:      ais.aisstream    (JSON, from aisstream.io)
+          ais.aishub       (JSON, future)
+          ais.local        (JSON, future receiver)
+Filtered: ais.coarse       (JSON, stateless filtered)
+          ais.filtered     (JSON, smart filtered)
+Merged:   ais.merged       (JSON, deduplicated, source-tagged)
+Events:   events.anomalies     (Protobuf)
+          events.sar_triggers  (Protobuf)
+          events.watchlist     (Protobuf)
+
+## Serialisation Rules
+- Raw AIS topics: JSON only — schema is external and unstable
+- Internal event topics: Protobuf
+- Document state: PostgreSQL JSONB
+- Spatial reference data: PostGIS native geometry
+- Never transcode raw AIS to Protobuf
+
+## ais-collector Specifics
+- OkHttp WebSocket client
+- Pluggable source interface: AisMessageSource, AisMessageHandler
+- Auto-reconnect on disconnect (aisstream disconnects every ~2min)
+- Defensive JSON deserialisation — aisstream API is beta/unstable,
+  handle unknown fields gracefully, never use strict typing
+- Stamp source name on every message before Kafka
+- Current implementation: AisStreamWebSocketSource
+
+## ais-analyser Specifics
+- Flink StreamExecutionEnvironment
+- SedonaFlink registered for spatial operations
+- Event-time processing with watermarks — always use event 
+  timestamps from AIS messages, never processing time
+- RocksDB state backend
+- State TTL: 48-72 hours for normal vessels
+- Watchlisted vessels: TTL suppressed
+- Two-tier state: RocksDB (hot) → PostgreSQL JSONB (cold)
+- On vessel reappearance: query PostgreSQL, rehydrate RocksDB
+- Watermark lag: keep tight, ~60 seconds
+
+## Detection Layers (ais-analyser)
+Layer 1: Physical plausibility
+         Speed vs vessel-type max speed (from VesselType enum)
+         Position on land = hard anomaly
+Layer 2: Gap/dark vessel detection
+         Event-time gap timers per vessel
+         Cross-check against coverage zone
+Layer 3: Multi-vessel coherence
+         DBSCAN clustering of simultaneous anomalies
+         Temporal persistence required before alerting
+Layer 4: STS transfer detection
+         Proximity detection, near-zero speed, extended duration
+Layer 5: IMO disappearance tracking
+         Per-IMO timer, escalating score on non-reappearance
+
+## Anomaly Scoring
+- Fuzzy confidence scores, not binary thresholds
+- All signals produce 0.0-1.0 scores with weights
+- Scores accumulate in per-vessel Flink state
+- Alert when score exceeds threshold AND sustained over time window
+- VesselAnomalyState holds per-signal scores + aggregate
+
+## PostgreSQL JSONB Collections
+- vessels          enriched per-vessel state, static history
+- watchlist        uncertainty cones + geometry column
+- trade_flows      cargo movement inferences
+- anomaly_history  scored events over time
+
+## PostGIS Reference Layers
+- coastline              land/sea boundary
+- ports                  port polygons
+- anchorages             anchorage polygons
+- coverage_buffer        200km coastal coverage zone
+- navigable_water        for realistic routing distances
+
+## Spatial Operations
+- Always use ST_DistanceSphere for speed/distance calculations
+- Coordinates always WGS84 (EPSG:4326)
+- AIS data is lon/lat order — be explicit when constructing points
+- Broadcast state pattern for static polygon lookups in Flink
+- Position on land = spoofing signal, do NOT filter it out
+
+## Common Module Contents
+- AisMessage, PositionReport, ShipStaticData (Jackson models)
+- KafkaTopics constants class
+- Protobuf generated classes
+- VesselType enum with maxSpeedKnots
+- Geographic constants
+
+## Key Design Decisions
+- Flink not Spark — stateful streaming, event-time correctness
+  during Minisforum offline/catch-up scenarios
+- Redpanda everywhere — Kafka-compatible, lighter than Kafka
+- No MongoDB — PostgreSQL JSONB sufficient for document storage
+- No parent pom — independent Maven modules
+- Raw JSON preserved in Kafka — never transcode external data
+- Position on land is anomaly signal, not filter candidate
+- UN sanctions only — unilateral sanctions not treated as law
+- Naming: use behavioural/observational language, not judgement
+  language (anomalous behaviour, not violation)
+
+## What This Project Is NOT
+- Not a sanctions enforcement tool
+- Not dependent on any paid data source
+- Not real-time in the millisecond sense — seconds to minutes 
+  latency is acceptable
+- Not attempting global coverage — coastal coverage accepted
+
+## Current Development State
+- Planning phase complete
+- ais-collector: exploratory phase
+  Initial goal: connect to aisstream.io, print messages 
+  to console, understand message types and field population
+- All other modules: not yet started
