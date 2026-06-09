@@ -32,7 +32,16 @@
     </dependencies>
 
     <build>
-
+        <plugins>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>3.2.0</version>
+                <configuration>
+                    <mainClass>io.maritimeflow.collector.AisCollectorMain</mainClass>
+                </configuration>
+            </plugin>
+        </plugins>
     </build>
 </project>
 
