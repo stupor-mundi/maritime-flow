@@ -5,7 +5,7 @@
     <modelVersion>4.0.0</modelVersion>
 
     <groupId>org.stupormundi</groupId>
-    <artifactId>ais-collector</artifactId>
+    <artifactId>ais-collector-websocket</artifactId>
     <version>0.1.0</version>
     <packaging>jar</packaging>
 
@@ -27,8 +27,6 @@
             <version>2.17.0</version>
         </dependency>
 
-
-
     </dependencies>
 
     <build>
@@ -44,4 +42,3 @@
         </plugins>
     </build>
 </project>
-

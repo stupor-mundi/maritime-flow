@@ -3,5 +3,5 @@ Reads ais.aisstream, applies coarse stateless filtering
     zero, no course change)
     Collapses repeated identical anchor positions
     Writes reduced stream to ais.coarse (7 day retention)
-    Runs on Hetzner alongside ais-collector
+    Runs on Hetzner alongside ais-collector-websocket
     No proximity logic — intentionally simple and lightweight
