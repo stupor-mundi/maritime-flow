@@ -1,166 +1,276 @@
 # maritime-flow
 
 ## Project Overview
-Maritime vessel tracking and trade flow inference system.
-Processes real-time AIS (Automatic Identification System) 
-data from vessels to detect anomalous behaviour and infer 
-trade flows. Built as a learning project for Flink, 
-SedonaFlink, Kafka, and remote sensing integration.
+Maritime vessel tracking and intelligence system for the Eastern
+Mediterranean. Receives AIS data from a self-operated field receiver
+on Troodos, Cyprus. Detects anomalous vessel behaviour and infers
+trade flows. Built as a companion learning project to air-cargo,
+specifically for Apache Spark, SedonaSQL, and Delta Lake.
 
 ## Repository Structure
 maritime-flow/
-├── ais-collector/     WebSocket client, reads from aisstream.io, 
-│                      writes raw JSON to Kafka
-├── ais-filter/        Coarse stateless filter, runs on Hetzner
-├── ais-smartfilter/   Proximity and watchlist aware filter, 
-│                      runs on Minisforum
-├── ais-merge/         Multi-source deduplication
-├── ais-analyser/      Main Flink + SedonaFlink processing app
-├── common/            Shared models, constants, enums
-├── reference-data/    PostGIS layer loading scripts
-└── k8s/               K3s deployment manifests
+├── ais-collector-nmea/     Go app — UDP NMEA listener on Pi 4
+│                           receives from field phone, → Redpanda
+├── ais-collector-websocket/ Java — WebSocket client (dormant)
+│                           was aisstream.io collector
+│                           kept in case a stream source returns
+├── ais-analyser/           Spark + SedonaSQL batch analytical engine
+│                           reads accumulated NMEA from Pi 4 Redpanda
+│                           writes to Delta Lake
+├── common/                 Shared models, NMEA parsing, MMSI handling
+├── reference-data/         PostGIS DDL scripts, OurAIS reference data
+│                           airspace/coverage polygon scripts
+└── k8s/                    K3s manifests — Spark Operator on Minisforum
 
 ## Language and Build
-- Java 17
-- Maven, no parent pom — each module is an independent 
-  Maven project
-- No Gradle suggestions
-- No Kotlin suggestions
+- ais-collector-nmea: Go 1.22+
+- All other modules: Java 17, Maven, no parent pom
+- Do not suggest Gradle, Kotlin, or Spring Boot
+- Do not fetch external URLs autonomously
+- If documentation needed, ask user to provide the section
 
 ## Core Technology Stack
-- Apache Flink — stream processing engine
-- Apache SedonaFlink — spatial operations on Flink streams
-- Redpanda — Kafka-compatible message broker (used everywhere,
-  referred to as Kafka in code)
-- PostgreSQL + PostGIS — spatial reference layers and 
-  vessel state document store (JSONB)
-- OkHttp — WebSocket client in ais-collector
-- Jackson — JSON serialisation/deserialisation
-- Protobuf — internal Kafka event topics only
-- MapLibre GL JS — globe frontend (future)
-- Sentinel/Copernicus API — SAR imagery integration (future)
+- Apache Spark — batch analytical engine (not Flink — see design decisions)
+- Apache SedonaSQL — spatial operations in SparkSQL
+- Redpanda — Kafka-compatible broker (always-on on Pi 4)
+- PostgreSQL + PostGIS — spatial reference layers, operational state
+- Delta Lake — analytical archive (Spark's native format)
+- DuckDB — ad-hoc queries on Delta Lake tables
+- Go — ais-collector-nmea (single binary, no JVM, systemd service)
+- Jackson — JSON serialisation in Java modules
+- MQTT (Mosquitto) — field node command/control and telemetry
+
+## Why Spark not Flink
+maritime-flow is a batch analytical system, not a real-time streaming
+system. Data accumulates on Pi 4 Redpanda while Minisforum is off.
+Spark batch processes the accumulated data on demand. This is the
+opposite of air-cargo which uses Flink for stateful per-aircraft
+streaming. The two projects are deliberately complementary:
+
+  air-cargo:       Flink streaming → Iceberg
+  maritime-flow:   Spark batch → Delta Lake
+
+Flink → Iceberg and Spark → Delta Lake are both structurally correct
+pairings. Do not suggest switching maritime-flow to Flink.
 
 ## Infrastructure
-Hetzner VPS (always on):
-- ais-collector, ais-filter
-- Redpanda: topics ais.aisstream, ais.coarse (7 day retention)
+Field node (Troodos/Czubek, Cyprus):
+  BraX2 phone + RTL-SDR V4 via USB OTG
+  AIS-catcher for Android — decodes AIS, forwards NMEA
+  Mobile data SIM (CYTA) — forwards to AISHub + Pi 4
+  LiFePO4 power bank + flexible solar panel
+  MQTT: subscribes to commands, publishes health/photos
 
-Minisforum CachyOS (usually on):
-- All other modules
-- Redpanda: long term archive 30+ days
-- MirrorMaker 2: replicates from Hetzner
-- K3s: runs ais-analyser, PostGIS, frontend
+Pi 4 at home (always on):
+  Receives NMEA from field phone via UDP (port 10110)
+  ais-collector-nmea (Go, systemd) → Redpanda ais.nmea
+  Mosquitto MQTT broker — field node command/control
+  DuckDNS — keeps home IP mapped to hostname
+  Wireguard VPN — remote access from anywhere
+  USB SSD (2TB) — long-term raw NMEA archive
 
-## Kafka Topics
-Raw:      ais.aisstream    (JSON, from aisstream.io)
-          ais.aishub       (JSON, future)
-          ais.local        (JSON, future receiver)
-Filtered: ais.coarse       (JSON, stateless filtered)
-          ais.filtered     (JSON, smart filtered)
-Merged:   ais.merged       (JSON, deduplicated, source-tagged)
-Events:   events.anomalies     (Protobuf)
-          events.sar_triggers  (Protobuf)
-          events.watchlist     (Protobuf)
+Minisforum CachyOS (run on demand):
+  K3s: Spark Operator, PostGIS StatefulSet
+  Spark reads from Pi 4 Redpanda
+  Processes accumulated NMEA in batch
+  Writes analytical results to Delta Lake
 
-## Serialisation Rules
-- Raw AIS topics: JSON only — schema is external and unstable
-- Internal event topics: Protobuf
-- Document state: PostgreSQL JSONB
-- Spatial reference data: PostGIS native geometry
-- Never transcode raw AIS to Protobuf
+No Hetzner — was planned for aisstream.io WebSocket relay.
+aisstream.io went dark March 2026. Architecture does not need
+always-on cloud relay. Pi 4 is the always-on component.
 
-## ais-collector Specifics
-- OkHttp WebSocket client
-- Pluggable source interface: AisMessageSource, AisMessageHandler
-- Auto-reconnect on disconnect (aisstream disconnects every ~2min)
-- Defensive JSON deserialisation — aisstream API is beta/unstable,
-  handle unknown fields gracefully, never use strict typing
-- Stamp source name on every message before Kafka
-- Current implementation: AisStreamWebSocketSource
+## Kafka Topics (on Pi 4 Redpanda)
+  ais.nmea          raw NMEA sentences from field phone
+                    key = MMSI, value = NMEA string
+                    long retention — this is the raw archive
+                    all downstream processing reads from here
 
-## ais-analyser Specifics
-- Flink StreamExecutionEnvironment
-- SedonaFlink registered for spatial operations
-- Event-time processing with watermarks — always use event 
-  timestamps from AIS messages, never processing time
-- RocksDB state backend
-- State TTL: 48-72 hours for normal vessels
-- Watchlisted vessels: TTL suppressed
-- Two-tier state: RocksDB (hot) → PostgreSQL JSONB (cold)
-- On vessel reappearance: query PostgreSQL, rehydrate RocksDB
-- Watermark lag: keep tight, ~60 seconds
+No topic proliferation. One raw topic, Spark reads and processes.
+Do not create intermediate Kafka topics.
 
-## Detection Layers (ais-analyser)
-Layer 1: Physical plausibility
-         Speed vs vessel-type max speed (from VesselType enum)
-         Position on land = hard anomaly
-Layer 2: Gap/dark vessel detection
-         Event-time gap timers per vessel
-         Cross-check against coverage zone
-Layer 3: Multi-vessel coherence
-         DBSCAN clustering of simultaneous anomalies
-         Temporal persistence required before alerting
-Layer 4: STS transfer detection
-         Proximity detection, near-zero speed, extended duration
-Layer 5: IMO disappearance tracking
-         Per-IMO timer, escalating score on non-reappearance
+## MQTT Topics
+  field/troodos/commands      Pi → phone
+                              "snap-panel", "snap-sea",
+                              "reboot", "status", "restart-ais"
+  field/troodos/photos        phone → Pi (base64 image)
+  field/troodos/health        phone → Pi (battery, signal, uptime)
+  field/troodos/nmea          phone → Pi (NMEA via MQTT, QoS 1)
+  agro/+/+                    future agricultural sensors
 
-## Anomaly Scoring
-- Fuzzy confidence scores, not binary thresholds
-- All signals produce 0.0-1.0 scores with weights
-- Scores accumulate in per-vessel Flink state
-- Alert when score exceeds threshold AND sustained over time window
-- VesselAnomalyState holds per-signal scores + aggregate
+## Delta Lake Tables (on Minisforum)
+  vessels           enriched per-vessel state, one row per MMSI
+                    MERGE on update — Delta Lake MERGE semantics
+  tracks            vessel position history, OBSERVED tier only
+                    partitioned by date + mmsi
+                    Z-ordered by (latitude, longitude)
+  gaps              gap records — Tier 1 facts only
+                    gap_classification populated by batch job
+  implied_tracks    tessellated great circle display geometries
+                    display_only=true, never joined analytically
 
-## PostgreSQL JSONB Collections
-- vessels          enriched per-vessel state, static history
-- watchlist        uncertainty cones + geometry column
-- trade_flows      cargo movement inferences
-- anomaly_history  scored events over time
+## Track Point Tiers
+Three tiers — must never be mixed in analytical data:
+  Tier 1: OBSERVED      real AIS positions, full analytical value
+  Tier 2: INFERRED      analytically deduced, carry uncertainty score
+  Tier 3: TESSELLATION  geometric rendering nodes, no analytical value
+                        stored only in implied_tracks display table
 
-## PostGIS Reference Layers
-- coastline              land/sea boundary
-- ports                  port polygons
-- anchorages             anchorage polygons
-- coverage_buffer        200km coastal coverage zone
-- navigable_water        for realistic routing distances
+## Serialisation
+- ais.nmea: raw NMEA strings — never transcode external data
+- Delta Lake: Parquet columnar, lat/lon as double columns
+- PostgreSQL: JSONB for operational state
+- Internal: Protobuf for any future event topics
+
+## ais-collector-nmea (Go)
+Plain Go console app, systemd service on Pi 4.
+Single binary, no JVM, ~10-15MB memory.
+
+Structure:
+  main.go              UDP socket loop, DatagramSocket on port 10110
+  nmea_validator.go    checksum + format check
+  mmsi_extractor.go    pulls MMSI from sentence for Kafka key
+  kafka_producer.go    standard Kafka client → Redpanda
+  config.go            UDP port + bootstrap servers from env vars
+
+Kafka topic: ais.nmea, key=MMSI, value=raw NMEA string
+systemd service: Restart=always, env vars for config
+
+## ais-collector-websocket (Java, DORMANT)
+Original aisstream.io WebSocket client.
+aisstream.io went dark March 2026.
+Keep code intact — do not delete or modify.
+A future WebSocket AIS feed may emerge.
+README explains the history and dormant status.
+
+## ais-analyser (Spark + SedonaSQL)
+Batch processing of accumulated NMEA from Pi 4 Redpanda.
+Runs on demand on Minisforum via K3s Spark Operator.
+
+Spark + Sedona Docker image:
+  BASE: apache/spark:3.4.1
+  DO NOT use apache/sedona image — it bundles its own Spark
+  master/worker, clashes with Spark Operator.
+  Layer Sedona on top of apache/spark base image.
+
+SparkSQL + SedonaSQL for spatial queries.
+Delta Lake for analytical output.
+MERGE semantics for vessel record updates.
+OPTIMIZE ZORDER BY (latitude, longitude) for spatial queries.
+
+## PostGIS Reference Layers (reference schema)
+  reference.ports              port polygons
+  reference.anchorages         anchorage polygons
+  reference.coastline          land/sea boundary
+  reference.coverage_zones     ADS-B/AIS coverage classification
+                               hand-drawn in QGIS
+                               NORMAL | COVERAGE_HOLE | OCEAN
+  reference.airspace_restrictions  overflight bans, conflict zones
+                               DATA_SUPPRESSION zones (China etc.)
+
+## Coverage Gap Classification
+Not all gaps are equal:
+  OCEAN:              landing impossible, flight/voyage continued
+  COVERAGE_HOLE:      land area, no receivers, ambiguous
+  REGULATORY_SUPPRESSION: data actively prevented from leaving
+                          country (China, North Korea etc.)
+                          treat as data void
+  ANOMALOUS:          gap in well-covered area — high signal
+
+## AIS Technical Notes
+VHF 162MHz, two channels, TDMA self-organising.
+Class A (large commercial): transmits every 2-10 seconds
+Class B (smaller vessels): every 30 seconds
+NMEA 0183 format — sentences starting with ! or $
+AIS is open unencrypted radio — legally receivable by anyone.
+aisstream.io went dark — do not depend on any third-party feed.
+Own receiver is the primary data source.
+
+## Key Identifiers
+MMSI:       Maritime Mobile Service Identity — primary vessel key
+            9 digits, always string (leading zeros significant)
+IMO:        International Maritime Organization number
+            permanent vessel identifier, more stable than MMSI
+            but not always present in AIS messages
+Callsign:   changes, not reliable as identifier
+
+## Vessel Types of Interest
+Tankers (crude, product, chemical, LNG)
+Bulk carriers
+Container ships
+Cargo vessels
+Military/government vessels
+Fishing vessels (IUU detection)
 
 ## Spatial Operations
-- Always use ST_DistanceSphere for speed/distance calculations
+- ST_DistanceSphere for distance calculations
+- ST_Within for port/anchorage proximity
+- ST_DWithin with geography cast for metre-accurate proximity
 - Coordinates always WGS84 (EPSG:4326)
-- AIS data is lon/lat order — be explicit when constructing points
-- Broadcast state pattern for static polygon lookups in Flink
-- Position on land = spoofing signal, do NOT filter it out
+- AIS data: longitude first, latitude second in position reports
+  be explicit when constructing geometry points
+- Position on land = spoofing signal — do NOT filter it out
 
-## Common Module Contents
-- AisMessage, PositionReport, ShipStaticData (Jackson models)
-- KafkaTopics constants class
-- Protobuf generated classes
-- VesselType enum with maxSpeedKnots
-- Geographic constants
+## Anomaly Scoring
+Fuzzy 0.0-1.0 scores throughout. No binary thresholds.
+Scores accumulate in per-vessel Spark state.
 
-## Key Design Decisions
-- Flink not Spark — stateful streaming, event-time correctness
-  during Minisforum offline/catch-up scenarios
-- Redpanda everywhere — Kafka-compatible, lighter than Kafka
-- No MongoDB — PostgreSQL JSONB sufficient for document storage
-- No parent pom — independent Maven modules
-- Raw JSON preserved in Kafka — never transcode external data
-- Position on land is anomaly signal, not filter candidate
+Signals:
+  Dark period in covered area          high score
+  AIS position on land                 hard anomaly (spoofing)
+  Speed physically impossible          hard anomaly
+  STS (ship-to-ship) transfer          medium score
+  Port call in sanctioned location     high score
+  Route deviation from baseline        medium score
+  Gap classification: ANOMALOUS        high score
+  Gap classification: COVERAGE_HOLE    low/zero score
+
+## Design Decisions
+- Spark not Flink — batch analytical workload, not streaming
+- Delta Lake not Iceberg — Spark's native format, first-class support
+- Pi 4 always on, Minisforum on demand — raw-first data accumulation
+- No Hetzner — aisstream.io dead, own receiver eliminates need
+- No aisstream.io dependency — self-operated field node
+- Raw NMEA preserved in Redpanda — never transcode external data
+- Go for ais-collector-nmea — single binary, no JVM on Pi 4
+- One raw Kafka topic — no intermediate topic proliferation
+- DuckDB for ad-hoc Delta Lake queries — no query engine needed
+- Coverage polygons in PostGIS — editable in QGIS, JDBC joins
 - UN sanctions only — unilateral sanctions not treated as law
-- Naming: use behavioural/observational language, not judgement
-  language (anomalous behaviour, not violation)
+- Observational language — never judgemental terminology
+  (anomalous behaviour, not violation)
+- Position on land is anomaly signal, not filter candidate
+- Track point tiers strictly separated — tessellation never
+  stored in analytical tables
 
 ## What This Project Is NOT
+- Not a real-time system — batch processing on demand
+- Not dependent on any paid or third-party data source
+- Not attempting global coverage — Eastern Med focus
 - Not a sanctions enforcement tool
-- Not dependent on any paid data source
-- Not real-time in the millisecond sense — seconds to minutes 
-  latency is acceptable
-- Not attempting global coverage — coastal coverage accepted
+- Not always-on — Pi 4 is always on, Minisforum is not
 
 ## Current Development State
-- Planning phase complete
-- ais-collector: exploratory phase
-  Initial goal: connect to aisstream.io, print messages 
-  to console, understand message types and field population
-- All other modules: not yet started
+ais-collector-nmea:       ⬜ not yet written — first module to build
+ais-collector-websocket:  ✅ exists, DORMANT (aisstream.io dead)
+ais-analyser:             ⬜ not yet started (was ais-filter, rewritten)
+common:                   ⬜ review — models may need updating
+reference-data:           ⬜ PostGIS DDL exists, needs coverage zone
+                             and airspace restriction polygon scripts
+k8s:                      ⬜ needs update: Flink → Spark Operator
+Pi 4 infrastructure:      ⬜ not yet set up (OS install, Redpanda,
+                             DuckDNS, Wireguard, Mosquitto)
+Field node:               ⬜ IRL recon pending (Troodos/Czubek)
+Delta Lake:               ⬜ not yet implemented
+
+## Next Development Task
+ais-collector-nmea in Go:
+  UDP DatagramSocket on port 10110
+  NMEA validation (checksum, format)
+  MMSI extraction for Kafka key
+  Produce to Redpanda ais.nmea topic
+  Config from env vars
+  systemd service on Pi 4
+  ~200-300 lines total
+
+Always use Plan mode unless explicitly instructed otherwise.
+Do not switch to Agent mode autonomously.
